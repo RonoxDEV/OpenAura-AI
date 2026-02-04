@@ -20,8 +20,8 @@
             "path": "C:/Users/Maxence/Desktop/Teste Aura AI"
         }
     ],
-    "ai_personality": 0.5,
-    "system_prompt_style": "balanced_professional",
+    "ai_personality": 1.0,
+    "system_prompt_style": "casual_engaging",
     "output_channels": {},
     "supervisor": {
         "email": "maxenceberthomieubernard@gmail.com",
@@ -33,8 +33,8 @@
     },
     "security_autodelete": true,
     "schedule": {
-        "Vendredi_0": "passif",
-        "Vendredi_1": "actif"
+        "Mardi_0": "passif",
+        "Mardi_1": "actif"
     },
-    "scraping_summary": "Voici la fiche d'identité de l'entreprise ATMAN Manufacture :\n\n**Activité** : Développement et fabrication de solutions haut de gamme innovantes pour le bien-être, l'art de vivre et les 5 sens.\n\n**Produits/Services Phares** :\n\n* Sylph : haut-parleur haut de gamme intégrant des systèmes électromécaniques\n* NATIV : sèche-serviettes ultra design personnalisable\n\n**Valeurs/Philosophie** :\n\n* Innovation technologique\n* Exclusivité\n* Qualité française\n* Design et esthétisme\n* Respect de l'environnement\n* Engagement pour la réduction de l'empreinte carbone\n* Priorité aux personnes et à la créativité\n* Qualité et robustesse des produits\n* Service après-vente efficace\n* Conception sans obsolescence programmée\n* Fidélité à l'excellence."
+    "scraping_summary": "Voici une fiche d'identité (Activité, Produits, Valeurs) pour ATMAN Manufacture :\n\n**Activité**\n\n* Développement et fabrication de solutions haut de gamme innovantes autour du bien-être, de l'art de vivre et des 5 sens\n* Conception et fabrication d'objets connectés de haute qualité\n* Spécialisation dans la création de produits personnalisés et exclusifs\n\n**Produits**\n\n* Sylph : haut-parleur haut de gamme intégrant des systèmes électromécaniques\n* NATIV : sèche-serviettes ultra design personnalisable\n* Autres produits (pas spécifiés dans le texte)\n\n**Valeurs**\n\n* Qualité française et technologie au service du quotidien\n* Innovation et créativité\n* Exclusivité et personnalisation\n* Respect de l'environnement (fabrication en France, réduction de l'empreinte carbone)\n* Service après-vente efficace\n* Engagement pour l'excellence et la qualité\n* Liberté de création et de fabrication\n* Priorité aux personnes et à la qualité de vie\n* Design et produits robustes (conception sans obsolescence programmée)\n* Plaisir et confort pour les utilisateurs\n* Fidélité à la marque et à ses valeurs."
 }

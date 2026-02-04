@@ -62,7 +62,7 @@ class AuraBrain:
             self.log(f"❌ Erreur sauvegarde config : {e}")
 
     def init_db(self):
-        """Crée la BDD et met à jour le schéma pour le Snapshot"""
+        """Crée la BDD et force la mise à jour du schéma"""
         try:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
@@ -74,20 +74,21 @@ class AuraBrain:
                     timestamp TEXT,
                     event_type TEXT,
                     file_path TEXT,
-                    content_summary TEXT  -- Nouvelle colonne pour le Snapshot
+                    content_summary TEXT
                 )
             ''')
             
-            # Migration : Ajout de la colonne si elle manque (pour les anciens utilisateurs)
-            try:
+            # VÉRIFICATION DE LA COLONNE SNAPSHOT
+            cursor.execute("PRAGMA table_info(file_events)")
+            columns = [info[1] for info in cursor.fetchall()]
+            if "content_summary" not in columns:
+                self.log("🔧 Mise à jour de la base de données (Patch v2)...")
                 cursor.execute("ALTER TABLE file_events ADD COLUMN content_summary TEXT")
-            except sqlite3.OperationalError:
-                pass # La colonne existe déjà
-
+            
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_filepath ON file_events (file_path)")
             conn.commit()
             conn.close()
-            self.log(f"🧠 Mémoire connectée (Snapshot Ready).")
+            self.log(f"🧠 Mémoire connectée.")
         except Exception as e:
             self.log(f"❌ ERREUR CRITIQUE BDD : {e}")
 
@@ -121,15 +122,16 @@ class AuraBrain:
         """Boucle infinie qui traite les fichiers en attente d'analyse"""
         while not self.stop_event.is_set():
             try:
-                # On attend un fichier (timeout 1s pour vérifier stop_event)
+                # On attend un fichier
                 event_id, file_path, event_type = self.analysis_queue.get(timeout=1)
                 
-                # Si c'est une suppression, on ne peut rien analyser (trop tard)
-                if event_type == "🗑️ SUPPRIMÉ":
+                # Si c'est une suppression, on ignore
+                if "SUPPRIMÉ" in event_type:
                     self.analysis_queue.task_done()
                     continue
 
-                self.log(f"👁️ Analyse approfondie : {os.path.basename(file_path)}")
+                filename = os.path.basename(file_path)
+                self.log(f"👁️ [ANALYSE PROFONDE] {filename}...")
                 
                 # 1. Extraction du contenu (OCR / Vision / Texte)
                 content = self.analyze_file_content(file_path)
@@ -137,7 +139,9 @@ class AuraBrain:
                 # 2. Mise à jour de la BDD (Snapshot)
                 if content:
                     self.update_db_snapshot(event_id, content)
-                    self.log(f"💾 Snapshot enregistré pour {os.path.basename(file_path)}")
+                    self.log(f"💾 Snapshot OK : {filename}")
+                else:
+                    self.log(f"⚠️ Snapshot vide pour {filename}")
                 
                 self.analysis_queue.task_done()
                 
@@ -154,30 +158,37 @@ class AuraBrain:
             conn.commit()
             conn.close()
         except Exception as e:
-            print(f"Erreur Update DB: {e}")
+            self.log(f"❌ Erreur Update DB: {e}")
 
     def analyze_file_content(self, path):
-        """Détecte le type et lance l'analyse appropriée (Vision/Text)"""
+        """Détecte le type et lance l'analyse appropriée"""
         if not os.path.exists(path): return "[Fichier inaccessible]"
         
         ext = os.path.splitext(path)[1].lower()
         
-        # --- CAS 1 : IMAGES (VISION + OCR) ---
+        # CAS 1 : IMAGES (VISION + OCR)
         if ext in [".jpg", ".jpeg", ".png", ".bmp", ".webp"]:
             return self._analyze_image_with_vision(path)
 
-        # --- CAS 2 : PDF ---
+        # CAS 2 : PDF
         if ext == ".pdf":
             try:
                 reader = pypdf.PdfReader(path)
                 text = ""
-                for i in range(min(3, len(reader.pages))): # Max 3 pages
-                    text += reader.pages[i].extract_text()
-                return "CONTENU PDF : " + text[:1500].replace("\n", " ")
-            except:
-                return "[Erreur lecture PDF]"
+                # On lit max 3 pages
+                for i in range(min(3, len(reader.pages))):
+                    page_text = reader.pages[i].extract_text()
+                    if page_text: text += page_text
+                
+                if len(text.strip()) < 10:
+                    # Si le PDF est vide de texte (scan), on devrait utiliser la vision (Optionnel v2)
+                    return "[PDF Scanné (Image) - Texte non extractible simple]"
+                
+                return "CONTENU PDF : " + text[:2000].replace("\n", " ")
+            except Exception as e:
+                return f"[Erreur lecture PDF: {e}]"
 
-        # --- CAS 3 : TEXTE BRUT ---
+        # CAS 3 : TEXTE BRUT
         valid_exts = [".txt", ".md", ".py", ".json", ".html", ".css", ".csv", ".xml", ".ini", ".log"]
         if ext in valid_exts:
             try:
@@ -185,24 +196,21 @@ class AuraBrain:
                     return "CONTENU TEXTE : " + f.read(2000).replace("\n", " ")
             except: return "[Erreur lecture Texte]"
             
-        return "[Type de fichier non analysable]"
+        return "[Fichier binaire non analysé]"
 
     def _analyze_image_with_vision(self, image_path):
-        """Envoie l'image à Llama-3.2-Vision via API Ollama"""
+        """Envoie l'image à Llama-3.2-Vision"""
         if not self.ensure_ollama_ready(): return "[IA non dispo]"
         
         try:
-            # Encodage Base64
             with open(image_path, "rb") as f:
                 img_bytes = f.read()
                 img_b64 = base64.b64encode(img_bytes).decode('utf-8')
 
-            model = "llama3.2-vision" # Force le modèle Vision
+            # On force un modèle Vision
+            model = "llama3.2-vision"
             
-            prompt = """Analyze this image in detail. 
-            1. If there is text (OCR), transcribe it exactly.
-            2. Describe the visual content (objects, diagrams).
-            3. Summarize the purpose of this document/image."""
+            prompt = "Describe this image in detail. Extract any text visible (OCR)."
 
             payload = {
                 "model": model,
@@ -214,14 +222,14 @@ class AuraBrain:
             response = requests.post(OLLAMA_API_URL, json=payload)
             if response.status_code == 200:
                 desc = response.json().get("response", "").strip()
-                return f"ANALYSE VISION (OCR) : {desc}"
+                return f"ANALYSE VISION : {desc}"
             else:
                 return f"[Erreur Vision: {response.text}]"
 
         except Exception as e:
             return f"[Erreur Vision Critique: {e}]"
 
-    # --- SCRAPING (Inchangé) ---
+    # --- SCRAPING ---
     def start_learning_process(self):
         if "scraping_summary" in self.config and self.config["scraping_summary"]:
             self.log("♻️ Identité entreprise chargée.")
@@ -255,7 +263,6 @@ class AuraBrain:
         targets = self.config.get("targets", [])
         if not targets: return
         
-        # On passe 'self' au handler pour qu'il puisse accéder à la Queue
         event_handler = AuraFileHandler(self.db_path, self.log, self.analysis_queue)
         
         for target in targets:
@@ -273,14 +280,14 @@ class AuraBrain:
 
     def _run_report_generation(self, callback):
         if not self.ensure_ollama_ready(): return
-        self.log("📝 Compilation du rapport avec les Snapshots...")
+        self.log("📝 Compilation du rapport avec Snapshots...")
 
         events_data = ""
         
         try:
             conn = sqlite3.connect(self.db_path, timeout=10)
             cursor = conn.cursor()
-            # On récupère TOUT : timestamp, type, nom, et surtout LE CONTENU DÉJÀ ANALYSÉ
+            # Sélectionne les événements récents AVEC le contenu
             cursor.execute("SELECT timestamp, event_type, file_path, content_summary FROM file_events ORDER BY timestamp DESC LIMIT 30")
             rows = cursor.fetchall()
             conn.close()
@@ -289,24 +296,22 @@ class AuraBrain:
                 callback("Rien à signaler.")
                 return
 
-            self.log(f"📊 Utilisation de {len(rows)} événements mémorisés...")
+            self.log(f"📊 Données chargées : {len(rows)} événements.")
 
             for row in rows:
                 ts, ev_type, fpath, content = row
                 fname = os.path.basename(fpath)
                 
-                # Si le contenu est vide (ex: suppression sans analyse préalable ou fichier ignoré)
-                if not content: content = "[Pas de contenu analysé disponible]"
+                # Gestion du contenu vide
+                if not content: 
+                    content = "[Contenu non analysé (Fichier trop rapide ou erreur)]"
+                elif len(content) > 500:
+                    content = content[:500] + "... (tronqué)"
                 
                 events_data += f"""
-                --- ÉVÉNEMENT ---
-                Heure : {ts}
-                Action : {ev_type}
-                Fichier : {fname}
-                CONTENU ANALYSÉ (SNAPSHOT) : 
-                {content}
-                -----------------
-                """
+- Heure: {ts} | Action: {ev_type} | Fichier: {fname}
+  DETAILS CONTENU: {content}
+"""
 
         except Exception as e:
             self.log(f"❌ Erreur Data: {e}")
@@ -315,28 +320,26 @@ class AuraBrain:
         company_context = self.config.get("scraping_summary", "Non défini")
         
         prompt = f"""
-        Tu es l'Analyste IA de l'entreprise.
+        Tu es l'Intelligence Artificielle de surveillance de l'entreprise.
         
         CONTEXTE ENTREPRISE :
         {company_context}
 
-        HISTORIQUE DES FICHIERS (AVEC ANALYSE DE CONTENU/OCR) :
+        LOGS D'ACTIVITÉ RÉCENTS :
         {events_data}
 
-        MISSION :
-        Rédige un rapport synthétique en Français.
-        1. Base-toi sur le "CONTENU ANALYSÉ" pour expliquer ce qui a été fait (ex: "Ajout d'un plan technique" et pas juste "Ajout fichier.pdf").
-        2. Si des images ont été ajoutées, décris ce qu'elles contiennent grâce à l'analyse OCR fournie.
-        3. Si des fichiers ont été supprimés, mentionne-le simplement.
-        4. Groupe les événements par projet si possible.
+        INSTRUCTIONS STRICTES :
+        1. Utilise les "DETAILS CONTENU" pour expliquer ce qui a été fait. Si le contenu parle d'un "Cahier des charges", dis-le !
+        2. Ne dis pas "Je ne peux pas voir". Les infos sont là.
+        3. Fais des phrases complètes. Ex: "Un nouveau cahier des charges a été ajouté, il semble concerner le projet X."
+        4. Ignore les fichiers "EXISTANT" sauf s'ils sont pertinents. Focus sur "NOUVEAU" et "SUPPRIMÉ".
         """
 
         self.log("🤖 Rédaction du rapport...")
         try:
-            model = self.config.get("selected_model_tag", "moondream")
-            # Astuce : Si on a Llama 3.2 Vision, on l'utilise aussi pour le texte, il est meilleur
-            if "vision" in model or "llama" in model: model = "llama3.2-vision"
-
+            # On force un modèle capable de lire du texte complexe
+            model = self.config.get("selected_model_tag", "llama3.2-vision")
+            
             payload = {"model": model, "prompt": prompt, "stream": False}
             response = requests.post(OLLAMA_API_URL, json=payload)
             if response.status_code == 200:
@@ -352,7 +355,7 @@ class AuraFileHandler(FileSystemEventHandler):
     def __init__(self, db_path, log_callback, analysis_queue):
         self.db_path = db_path
         self.log = log_callback
-        self.queue = analysis_queue # On récupère la file d'attente
+        self.queue = analysis_queue
         self.last_events = {} 
 
     def is_valid(self, path):
@@ -395,16 +398,14 @@ class AuraFileHandler(FileSystemEventHandler):
         try:
             conn = sqlite3.connect(self.db_path, timeout=10)
             cursor = conn.cursor()
-            # On insère l'événement de base (sans content_summary pour l'instant)
             cursor.execute("INSERT INTO file_events (timestamp, event_type, file_path) VALUES (?, ?, ?)",
                            (ts, type, path_to_log))
             event_id = cursor.lastrowid
             conn.commit()
             conn.close()
             
-            # --- OPTIMISATION : ENVOI EN QUEUE POUR ANALYSE IA ---
-            # On n'analyse que les créations et modifs, pas les suppressions (trop tard)
-            if type in ["NOUVEAU", "MODIFIÉ", "DÉPLACÉ"] and path_to_log:
+            # ENVOI POUR ANALYSE (Seulement si le fichier existe encore)
+            if type in ["NOUVEAU", "MODIFIÉ", "DÉPLACÉ"] and path_to_log and os.path.exists(path_to_log):
                 self.queue.put((event_id, path_to_log, type))
                 
         except Exception as e:
