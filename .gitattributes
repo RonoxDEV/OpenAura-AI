@@ -1,0 +1,21 @@
+# Forcer la détection automatique du texte
+* text=auto
+
+# S'assurer que les fichiers Python gardent un formatage propre
+*.py text diff=python
+
+# Fichiers de configuration et documentation
+*.json text
+*.md text
+*.yaml text
+
+# Déclarer les fichiers binaires (images, icônes) pour qu'ils ne soient pas corrompus
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.ico binary
+*.gif binary
+
+# Exécutables (si tu en stockes des versions de test)
+*.exe binary
+*.dll binary
