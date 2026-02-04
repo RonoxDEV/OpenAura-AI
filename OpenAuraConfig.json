@@ -1,0 +1,40 @@
+{
+    "install_type": "new",
+    "company_name": "Atman",
+    "website_url": "https://www.atmanmanufacture.com/",
+    "ai_engine": "local",
+    "api_provider": "",
+    "api_key": "",
+    "hardware_specs": {
+        "ram_gb": 31.9,
+        "vram_gb": 12,
+        "cpu_cores": 12,
+        "gpu_name": "AMD Radeon RX 7600 XT",
+        "rec_id": "big"
+    },
+    "selected_model": "",
+    "selected_model_tag": "llama3.2-vision",
+    "targets": [
+        {
+            "type": "local",
+            "path": "C:/Users/Maxence/Desktop/Teste Aura AI"
+        }
+    ],
+    "ai_personality": 0.5,
+    "system_prompt_style": "balanced_professional",
+    "output_channels": {},
+    "supervisor": {
+        "email": "maxenceberthomieubernard@gmail.com",
+        "smtp_config": {
+            "server": "smtp.gmail.com",
+            "port": "587",
+            "user": "maxenceberthomieubernard@gmail.com"
+        }
+    },
+    "security_autodelete": true,
+    "schedule": {
+        "Vendredi_0": "passif",
+        "Vendredi_1": "actif"
+    },
+    "scraping_summary": "Voici la fiche d'identité de l'entreprise ATMAN Manufacture :\n\n**Activité** : Développement et fabrication de solutions haut de gamme innovantes pour le bien-être, l'art de vivre et les 5 sens.\n\n**Produits/Services Phares** :\n\n* Sylph : haut-parleur haut de gamme intégrant des systèmes électromécaniques\n* NATIV : sèche-serviettes ultra design personnalisable\n\n**Valeurs/Philosophie** :\n\n* Innovation technologique\n* Exclusivité\n* Qualité française\n* Design et esthétisme\n* Respect de l'environnement\n* Engagement pour la réduction de l'empreinte carbone\n* Priorité aux personnes et à la créativité\n* Qualité et robustesse des produits\n* Service après-vente efficace\n* Conception sans obsolescence programmée\n* Fidélité à l'excellence."
+}

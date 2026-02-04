@@ -7,12 +7,21 @@ import os
 import psutil
 import platform
 import keyring
+import requests
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+import json
+import subprocess
+import shutil
 
 # Gestion de WMI uniquement pour Windows
 try:
     import wmi
+    import pythoncom
 except ImportError:
     wmi = None
+    pythoncom = None
 
 # --- CONFIGURATION DU LOOK ---
 ctk.set_appearance_mode("Light")
@@ -189,7 +198,10 @@ class WizardApp(ctk.CTk):
         self.progress_bar.pack(pady=10)
 
         self.lbl_detected_specs = ctk.CTkLabel(bench_frame, text="", font=("Arial", 12), text_color="gray")
-        self.lbl_detected_specs.pack(pady=(5, 5))
+        self.lbl_detected_specs.pack(pady=(5, 0))
+
+        self.lbl_recommendation = ctk.CTkLabel(bench_frame, text="", font=("Arial", 13, "bold"), text_color="#0066FF")
+        self.lbl_recommendation.pack(pady=(0, 10))
 
         self.btn_scan = ctk.CTkButton(
             bench_frame, text="Lancer l'analyse système", 
@@ -202,156 +214,197 @@ class WizardApp(ctk.CTk):
         self.create_nav_buttons(back_cmd=self.show_step_3_menu, next_cmd=self.show_step_3_local_model_choice)
         self.btn_next_global.configure(state="disabled")
 
+    # =========================================================================
+    # LE CŒUR DU SCANNER (AMÉLIORÉ CPU + GPU + VRAM)
+    # =========================================================================
     def run_real_benchmark(self):
-        self.btn_scan.configure(state="disabled", text="Analyse en cours...")
+        self.btn_scan.configure(state="disabled", text="Analyse approfondie...")
+        self.lbl_recommendation.configure(text="")
         
         def process_scan():
-            steps = ["Initialisation...", "Lecture de la mémoire système...", "Interrogation du GPU...", "Calcul du score IA..."]
-            for i, step in enumerate(steps):
-                time.sleep(0.5)
-                self.progress_bar.set((i + 1) / 5)
-                self.lbl_bench_status.configure(text=step)
-
+            if pythoncom:
+                pythoncom.CoInitialize()
+            
             try:
-                # --- SCAN RAM ---
+                steps = [
+                    "Recensement des coeurs CPU...", 
+                    "Test de la bande passante RAM...", 
+                    "Interrogation WMI du GPU...", 
+                    "Calcul du score d'IA Multimodale..."
+                ]
+                
+                for i, step in enumerate(steps):
+                    time.sleep(0.6) # Un peu de temps pour l'effet "pro"
+                    self.progress_bar.set((i + 1) / len(steps))
+                    self.lbl_bench_status.configure(text=step)
+
+                # --- A. SCAN CPU & RAM ---
+                # Coeurs physiques (plus importants que logiques pour l'IA)
+                cpu_cores = psutil.cpu_count(logical=False) or 4
+                cpu_freq = psutil.cpu_freq().max if psutil.cpu_freq() else 2500
                 ram_gb = round(psutil.virtual_memory().total / (1024**3), 1)
                 
-                # --- SCAN GPU (WMI) ---
+                # --- B. SCAN GPU (ROBUSTE & FALLBACK) ---
                 vram_gb = 0
-                gpu_name = "GPU Intégré / Inconnu"
+                gpu_name = "Chipset Intégré (CPU)"
                 
+                # Petite DB de secours si WMI échoue
+                GPU_FALLBACK_DB = {
+                    "RTX 3060": 12, "RTX 3070": 8, "RTX 3080": 10, "RTX 3090": 24,
+                    "RTX 4060": 8,  "RTX 4070": 12, "RTX 4080": 16, "RTX 4090": 24,
+                    "RX 6600": 8,   "RX 6700": 12,  "RX 6800": 16,  "RX 7600": 8, 
+                    "RX 7800": 16,  "RX 7900": 20
+                }
+
                 if wmi and platform.system() == "Windows":
                     try:
                         w = wmi.WMI()
                         for gpu in w.Win32_VideoController():
                             name = gpu.Name or ""
-                            if "NVIDIA" in name or "AMD" in name:
+                            # On cherche une vraie carte graphique
+                            if any(x in name.upper() for x in ["NVIDIA", "AMD", "RADEON", "RTX", "GTX"]):
                                 gpu_name = name
-                                # Tentative de lecture VRAM
+                                
+                                # Tentative 1 : WMI direct
                                 try:
                                     raw_vram = abs(int(gpu.AdapterRAM))
-                                    current_vram = raw_vram / (1024**3)
-                                    if current_vram > vram_gb:
-                                        vram_gb = round(current_vram, 1)
-                                except: pass
-                    except: pass
+                                    detected_vram = raw_vram / (1024**3)
+                                except: detected_vram = 0
 
-                # --- LOGIQUE DE RECOMMANDATION (Tiny / Medium / Big) ---
-                # Rec_id servira à surligner la carte sur la page suivante
-                rec_id = "tiny"
-                rec_reason = "Configuration légère"
+                                # Tentative 2 : Fallback DB si WMI buggé (<1GB sur une carte gamer)
+                                if detected_vram < 1.0:
+                                    name_upper = name.upper()
+                                    for key, val in GPU_FALLBACK_DB.items():
+                                        if key in name_upper:
+                                            detected_vram = val
+                                            # Correctif spécifique XT/Ti
+                                            if ("XT" in name_upper or "TI" in name_upper) and detected_vram < 12:
+                                                 detected_vram += 4 # Bonus estimation
+                                            break
+                                
+                                if detected_vram > vram_gb:
+                                    vram_gb = round(detected_vram, 1)
+                    except Exception as e:
+                        print(f"WMI Error: {e}")
 
-                if ram_gb >= 16:
+                # --- C. CALCUL DU SCORE DE PUISSANCE (ALGORITHME PONDÉRÉ) ---
+                # Formule : (VRAM * 3) + (RAM * 0.5) + (Cores * 0.5)
+                # La VRAM compte triple car c'est critique pour charger les modèles Vision.
+                
+                power_score = (vram_gb * 3) + (ram_gb * 0.5) + (cpu_cores * 0.5)
+                
+                # Détermination du profil
+                if power_score >= 35: # Ex: 10Go VRAM (30) + 16Go RAM (8) + 6 Cores (3) = 41
                     rec_id = "big"
-                    rec_reason = "RAM > 16GB : Prêt pour la Vision"
-                elif ram_gb >= 8:
+                    rec_reason = "🚀 Workstation Détectée (VRAM Élevée)"
+                elif power_score >= 18: # Ex: 4Go VRAM (12) + 16Go RAM (8) + 4 Cores (2) = 22
                     rec_id = "medium"
-                    rec_reason = "RAM 8-16GB : Équilibre Parfait"
+                    rec_reason = "✅ PC Performant (Capacité OCR Standard)"
                 else:
                     rec_id = "tiny"
-                    rec_reason = "RAM < 8GB : Modèle optimisé requis"
+                    rec_reason = "💻 Configuration Légère (Modèle Optimisé)"
 
-                # Fin Scan
+                # --- D. FINALISATION ---
                 self.progress_bar.set(1.0)
-                self.lbl_bench_status.configure(text="✅ Analyse terminée.", text_color="green")
+                self.lbl_bench_status.configure(text="✅ Analyse complète.", text_color="green")
                 
-                specs_text = f"Détecté : {ram_gb} Go RAM | {gpu_name} ({vram_gb} Go VRAM)"
-                self.lbl_detected_specs.configure(text=specs_text + f"\nRecommendation : {rec_reason}")
+                specs_text = f"Système : {cpu_cores} Cœurs | {ram_gb} Go RAM\nGraphique : {gpu_name} ({vram_gb} Go VRAM)"
+                self.lbl_detected_specs.configure(text=specs_text)
+                self.lbl_recommendation.configure(text=f"Score Puissance : {int(power_score)} | {rec_reason}")
 
                 # Sauvegarde
                 self.config["hardware_specs"] = {
                     "ram_gb": ram_gb,
+                    "vram_gb": vram_gb,
+                    "cpu_cores": cpu_cores,
                     "gpu_name": gpu_name,
-                    "rec_id": rec_id  # tiny, medium, ou big
+                    "rec_id": rec_id
                 }
                 
-                self.btn_next_global.configure(state="normal")
+                self.after(0, lambda: self.btn_next_global.configure(state="normal"))
 
             except Exception as e:
-                print(f"Erreur: {e}")
-                self.lbl_bench_status.configure(text="Erreur lors du scan (voir console)", text_color="red")
+                print(f"Fatal Error: {e}")
+                self.lbl_bench_status.configure(text="Erreur critique scan", text_color="red")
+            finally:
+                if pythoncom:
+                    pythoncom.CoUninitialize()
 
         threading.Thread(target=process_scan).start()
 
     # =========================================================================
-    # ÉTAPE 3 - C : NOUVELLE PAGE - CHOIX DU MODEL
+    # ÉTAPE 3-C : NOUVELLE PAGE - CHOIX DU MODEL (VISION / OCR)
     # =========================================================================
     def show_step_3_local_model_choice(self):
         self.clear_frame()
         
-        # Récupération de la reco
         specs = self.config.get("hardware_specs", {})
-        rec_id = specs.get("rec_id", "tiny") # tiny par défaut
+        rec_id = specs.get("rec_id", "tiny")
 
-        self.create_header(3, "Choix du Modèle IA", "Sélectionnez le cerveau de votre assistant.")
+        self.create_header(3, "Choix du Cerveau IA", "Sélectionnez un modèle capable de lire vos documents.")
         
-        # Conteneur des cartes
         cards_container = ctk.CTkFrame(self.main_frame, fg_color="transparent")
         cards_container.pack(fill="both", expand=True, padx=20)
 
-        # Définition des 3 modèles
+        # --- NOUVELLE LISTE DES MODÈLES VISION ---
         models_data = [
             {
                 "id": "tiny",
-                "name": "TinyLlama-1.1B",
-                "desc": "Ultra rapide. Idéal pour PC bureautique sans carte graphique.",
-                "req": "RAM: < 8GB"
+                "name": "Moondream2 (1.8B)",
+                "tag": "moondream",
+                "desc": "⚡ Ultra-Rapide & Léger.\nIdéal pour décrire des images simplement.\nPeu précis sur les longs textes.",
+                "req": "VRAM: < 3 GB (OK CPU)"
             },
             {
                 "id": "medium",
-                "name": "Llama-3.2-3B",
-                "desc": "Le standard actuel. Intelligent et réactif.",
-                "req": "RAM: 8GB - 16GB"
+                "name": "Qwen2-VL (7B)",
+                "tag": "qwen2-vl",
+                "desc": "👑 Le Roi de l'OCR.\nMeilleur que Llama pour lire tableaux et factures.\nExcellent équilibre.",
+                "req": "VRAM: 6 GB - 8 GB"
             },
             {
                 "id": "big",
-                "name": "Llama-3.2-Vision",
-                "desc": "Analyse d'images & Texte. Puissant mais gourmand.",
-                "req": "RAM: > 16GB"
+                "name": "Llama-3.2-Vision (11B)",
+                "tag": "llama3.2-vision",
+                "desc": "🧠 Intelligence Maximale.\nCompréhension profonde des schémas et plans.\nDemande une grosse carte graphique.",
+                "req": "VRAM: > 10 GB"
             }
         ]
 
-        # Création des 3 cartes
         for model in models_data:
             is_recommended = (model["id"] == rec_id)
             
-            # Style conditionnel
-            border_color = "#10B981" if is_recommended else "#E5E7EB" # Vert si reco
+            border_color = "#10B981" if is_recommended else "#E5E7EB"
             border_width = 3 if is_recommended else 2
-            bg_color = "#ECFDF5" if is_recommended else "white" # Fond vert très clair si reco
+            bg_color = "#ECFDF5" if is_recommended else "white"
 
-            card = ctk.CTkFrame(cards_container, width=250, height=350, fg_color=bg_color, 
+            card = ctk.CTkFrame(cards_container, width=250, height=380, fg_color=bg_color, 
                                 border_color=border_color, border_width=border_width, corner_radius=15)
             card.pack(side="left", padx=15, pady=10, expand=True)
             card.pack_propagate(False)
 
-            # Badge Recommandé
             if is_recommended:
                 ctk.CTkLabel(card, text="★ RECOMMANDÉ", text_color="#059669", font=("Arial", 12, "bold")).pack(pady=(15, 0))
             else:
-                ctk.CTkLabel(card, text=" ", font=("Arial", 12)).pack(pady=(15, 0)) # Espace
+                ctk.CTkLabel(card, text=" ", font=("Arial", 12)).pack(pady=(15, 0))
 
-            # Titre
             ctk.CTkLabel(card, text=model["name"], font=("Arial", 18, "bold"), text_color="#111827", wraplength=220).pack(pady=(10, 5))
-            
-            # Requis
-            ctk.CTkLabel(card, text=model["req"], font=("Arial", 11, "italic"), text_color="#6B7280").pack(pady=(0, 15))
+            ctk.CTkLabel(card, text=model["req"], font=("Arial", 12, "bold"), text_color="#DC2626").pack(pady=(0, 15))
 
-            # Desc
             ctk.CTkLabel(card, text=model["desc"], font=("Arial", 13), text_color="#374151", wraplength=220, justify="center").pack(pady=10)
 
-            # Bouton Choisir
-            btn_text = "Installer" if is_recommended else "Choisir"
+            btn_text = "Choisir ce modèle" if is_recommended else "Choisir"
             btn_col = "#10B981" if is_recommended else "#0066FF"
             
+            # On passe le 'tag' technique (ex: qwen2-vl) au lieu du nom d'affichage
             ctk.CTkButton(card, text=btn_text, fg_color=btn_col, font=("Arial", 14, "bold"),
-                          command=lambda m=model["name"]: self.select_model_and_continue(m)).pack(side="bottom", pady=25)
+                          command=lambda m=model["tag"]: self.select_model_and_continue(m)).pack(side="bottom", pady=25)
 
         self.create_nav_buttons(back_cmd=self.show_step_3_local_benchmark, next_cmd=None)
 
-    def select_model_and_continue(self, model_name):
-        self.config["selected_model"] = model_name
-        print(f"✅ Modèle choisi : {model_name}")
+    def select_model_and_continue(self, model_tag):
+        self.config["selected_model_tag"] = model_tag # <--- IMPORTANT
+        print(f"✅ Modèle choisi : {model_tag}")
         self.show_step_4_targets()
 
 
@@ -608,99 +661,287 @@ class WizardApp(ctk.CTk):
         self.show_step_6_output()
 
     # =========================================================================
-    # ÉTAPE 6 : OUTPUT & VALIDATION
+    # ÉTAPE 6 : OUTPUT & VALIDATION (Version Web / Universelle)
     # =========================================================================
     def show_step_6_output(self):
         self.clear_frame()
-        self.create_header(6, "Destination & Contrôle", "Où envoyer le rapport et qui doit le valider ?")
+        self.create_header(6, "Flux de Validation", "Diffusion et contrôle humain via Page Web.")
 
-        # Initialisation Config
+        # Init Config
         if "output_channels" not in self.config:
-            self.config["output_channels"] = []
-        if "validator_contact" not in self.config:
-            self.config["validator_contact"] = ""
+            self.config["output_channels"] = {} 
+        if "supervisor" not in self.config:
+            self.config["supervisor"] = {"email": "", "smtp_config": {}}
 
-        # --- PARTIE A : CANAUX DE SORTIE ---
+        # --- GAUCHE : LES CANAUX FINAUX ---
         channels_frame = ctk.CTkFrame(self.main_frame, fg_color="white", corner_radius=10, border_width=1, border_color="#E5E7EB")
-        channels_frame.pack(fill="x", padx=50, pady=(10, 20))
+        channels_frame.pack(fill="x", padx=50, pady=(10, 10))
 
-        ctk.CTkLabel(channels_frame, text="Canaux de Diffusion", font=("Arial", 14, "bold"), text_color="#374151").pack(anchor="w", padx=20, pady=(15, 10))
+        ctk.CTkLabel(channels_frame, text="1. Destination Finale (Après validation)", font=("Arial", 14, "bold"), text_color="#374151").pack(anchor="w", padx=20, pady=(15, 5))
 
-        # Checkboxes (On pourrait ajouter des icônes plus tard)
-        self.chk_discord = ctk.CTkCheckBox(channels_frame, text="Discord (Webhook)", font=("Arial", 13))
+        # Checkbox Discord
+        self.var_discord = ctk.IntVar()
+        self.chk_discord = ctk.CTkCheckBox(channels_frame, text="Discord (Webhook)", variable=self.var_discord, 
+                                           command=self.toggle_discord_input, font=("Arial", 13))
         self.chk_discord.pack(anchor="w", padx=40, pady=5)
-        
-        self.chk_email = ctk.CTkCheckBox(channels_frame, text="Email (SMTP)", font=("Arial", 13))
-        self.chk_email.pack(anchor="w", padx=40, pady=5)
-        
-        self.chk_slack = ctk.CTkCheckBox(channels_frame, text="Slack", font=("Arial", 13))
-        self.chk_slack.pack(anchor="w", padx=40, pady=5)
-        
-        # Restaurer l'état si déjà coché (logique simplifiée pour l'exemple)
-        if "Discord" in self.config["output_channels"]: self.chk_discord.select()
-        if "Email" in self.config["output_channels"]: self.chk_email.select()
-        if "Slack" in self.config["output_channels"]: self.chk_slack.select()
 
-        # Espace vide en bas du cadre
+        # Input Discord
+        self.discord_input_frame = ctk.CTkFrame(channels_frame, fg_color="transparent")
+        self.entry_discord_url = ctk.CTkEntry(self.discord_input_frame, width=400, placeholder_text="https://discord.com/api/webhooks/...")
+        self.entry_discord_url.pack(anchor="w", padx=40)
+        
+        if "discord_webhook" in self.config.get("output_channels", {}):
+            self.chk_discord.select()
+            self.toggle_discord_input()
+            self.entry_discord_url.insert(0, self.config["output_channels"]["discord_webhook"])
+
         ctk.CTkLabel(channels_frame, text="").pack(pady=5)
 
-        # --- PARTIE B : LE SUPERVISEUR ---
-        validator_frame = ctk.CTkFrame(self.main_frame, fg_color="transparent")
-        validator_frame.pack(fill="x", padx=50, pady=10)
+        # --- DROITE : LE SUPERVISEUR ---
+        supervisor_frame = ctk.CTkFrame(self.main_frame, fg_color="#F0F9FF", corner_radius=10, border_width=1, border_color="#BAE6FD")
+        supervisor_frame.pack(fill="x", padx=50, pady=10)
 
-        ctk.CTkLabel(validator_frame, text="Superviseur (Validateur Humain)", font=("Arial", 14, "bold"), text_color="#374151").pack(anchor="w", pady=(0, 5))
-        ctk.CTkLabel(validator_frame, text="Email ou ID Discord de la personne qui doit approuver le rapport.", font=("Arial", 12), text_color="gray").pack(anchor="w", pady=(0, 10))
-
-        self.entry_validator = ctk.CTkEntry(validator_frame, width=400, height=40, placeholder_text="ex: eric.b@atman.com")
-        self.entry_validator.pack(anchor="w", fill="x")
-        self.entry_validator.insert(0, self.config["validator_contact"])
-
-        # --- PARTIE C : SÉCURITÉ (OBLIGATOIRE) ---
-        security_frame = ctk.CTkFrame(self.main_frame, fg_color="#FEF2F2", corner_radius=10, border_width=1, border_color="#FCA5A5")
-        security_frame.pack(fill="x", padx=50, pady=20, ipady=10)
-
-        ctk.CTkLabel(security_frame, text="⚠️ Règle de Sécurité Critique", text_color="#B91C1C", font=("Arial", 13, "bold")).pack(anchor="w", padx=20, pady=(10, 5))
+        ctk.CTkLabel(supervisor_frame, text="2. Le Superviseur (Validation)", font=("Arial", 14, "bold"), text_color="#0369A1").pack(anchor="w", padx=20, pady=(15, 5))
         
-        self.chk_security = ctk.CTkCheckBox(security_frame, text="Si aucune validation n'est reçue avant lundi 8h00, le rapport est détruit automatiquement.",
-                                            text_color="#7F1D1D", onvalue="accepted", offvalue="refused")
-        self.chk_security.pack(anchor="w", padx=20, pady=10)
+        ctk.CTkLabel(supervisor_frame, text="Email du Superviseur :", font=("Arial", 12, "bold"), text_color="#0369A1").pack(anchor="w", padx=20)
+        
+        # Frame pour l'input + Bouton test
+        email_action_frame = ctk.CTkFrame(supervisor_frame, fg_color="transparent")
+        email_action_frame.pack(fill="x", padx=20, pady=(0, 10))
 
-        # Navigation
+        self.entry_supervisor_email = ctk.CTkEntry(email_action_frame, width=300, placeholder_text="eric.berthelin@atman.com")
+        self.entry_supervisor_email.pack(side="left", padx=(0, 10))
+        self.entry_supervisor_email.insert(0, self.config["supervisor"].get("email", ""))
+
+        # BOUTON DE TEST D'ENVOI
+        self.btn_test_email = ctk.CTkButton(email_action_frame, text="📧 Envoyer un rapport factice", 
+                                            fg_color="#0369A1", width=180,
+                                            command=self.send_validation_test)
+        self.btn_test_email.pack(side="left")
+
+        # Configuration SMTP
+        btn_smtp = ctk.CTkButton(supervisor_frame, text="⚙️ Configurer le Serveur SMTP (Robot)", 
+                                 fg_color="transparent", border_width=1, border_color="#0284C7", text_color="#0284C7",
+                                 command=self.open_smtp_popup)
+        btn_smtp.pack(anchor="w", padx=20, pady=(0, 20))
+
+        # --- SÉCURITÉ ---
+        security_frame = ctk.CTkFrame(self.main_frame, fg_color="transparent")
+        security_frame.pack(fill="x", padx=50, pady=5)
+        self.chk_security = ctk.CTkCheckBox(security_frame, text="Sécurité : Détruire le rapport si non validé sous 24h.",
+                                            text_color="#991B1B", onvalue="accepted", offvalue="refused")
+        self.chk_security.pack(anchor="w", padx=20)
+        self.chk_security.select()
+
         self.create_nav_buttons(back_cmd=self.show_step_5_personality, next_cmd=self.validate_step_6)
 
+    def toggle_discord_input(self):
+        if self.chk_discord.get() == 1:
+            self.discord_input_frame.pack(fill="x", pady=5)
+        else:
+            self.discord_input_frame.pack_forget()
+
+    # --- POPUP CONFIGURATION SMTP ---
+    def open_smtp_popup(self):
+        win = ctk.CTkToplevel(self)
+        win.title("Configuration Email (Robot)")
+        win.geometry("500x450")
+        win.grab_set()
+
+        ctk.CTkLabel(win, text="Configuration du Robot Expéditeur", font=("Arial", 16, "bold")).pack(pady=(20, 10))
+        ctk.CTkLabel(win, text="Ces identifiants servent uniquement à envoyer le mail de validation.", font=("Arial", 11), text_color="gray").pack()
+
+        # Formulaire
+        form = ctk.CTkFrame(win, fg_color="transparent")
+        form.pack(pady=20)
+
+        # Serveur
+        ctk.CTkLabel(form, text="Serveur SMTP").grid(row=0, column=0, sticky="w", pady=5, padx=5)
+        e_server = ctk.CTkEntry(form, width=250, placeholder_text="smtp.gmail.com")
+        e_server.grid(row=0, column=1, pady=5)
+        e_server.insert(0, "smtp.gmail.com") # Valeur par défaut courante
+
+        # Port
+        ctk.CTkLabel(form, text="Port").grid(row=1, column=0, sticky="w", pady=5, padx=5)
+        e_port = ctk.CTkEntry(form, width=250, placeholder_text="587")
+        e_port.grid(row=1, column=1, pady=5)
+        e_port.insert(0, "587")
+
+        # User
+        ctk.CTkLabel(form, text="Email du Robot").grid(row=2, column=0, sticky="w", pady=5, padx=5)
+        e_user = ctk.CTkEntry(form, width=250, placeholder_text="robot@atman.com")
+        e_user.grid(row=2, column=1, pady=5)
+
+        # Pass
+        ctk.CTkLabel(form, text="Mot de passe (App)").grid(row=3, column=0, sticky="w", pady=5, padx=5)
+        e_pass = ctk.CTkEntry(form, width=250, show="*")
+        e_pass.grid(row=3, column=1, pady=5)
+
+        # Restaurer valeurs existantes si présentes
+        saved_smtp = self.config["supervisor"].get("smtp_config", {})
+        if saved_smtp:
+            e_server.delete(0, "end"); e_server.insert(0, saved_smtp.get("server", ""))
+            e_port.delete(0, "end"); e_port.insert(0, saved_smtp.get("port", "587"))
+            e_user.delete(0, "end"); e_user.insert(0, saved_smtp.get("user", ""))
+            # Le mot de passe n'est pas affiché (il est dans le keyring), on laisse vide ou placeholder
+
+        # Boutons Action
+        def save_smtp():
+            s, p = e_server.get(), e_port.get()
+            u, pw = e_user.get(), e_pass.get()
+            
+            if not s or not u or not pw:
+                messagebox.showerror("Erreur", "Tous les champs sont requis.")
+                return
+
+            # Test de connexion réel
+            try:
+                server = smtplib.SMTP(s, int(p))
+                server.starttls()
+                server.login(u, pw)
+                server.quit()
+                
+                # Sauvegarde Sécurisée
+                keyring.set_password("OpenAura_SMTP", u, pw)
+                
+                self.config["supervisor"]["smtp_config"] = {
+                    "server": s,
+                    "port": p,
+                    "user": u
+                }
+                messagebox.showinfo("Succès", "Connexion SMTP réussie ! Configuration sauvegardée.")
+                win.destroy()
+            except Exception as e:
+                messagebox.showerror("Échec Connexion", f"Impossible de se connecter au serveur mail :\n{e}")
+
+        ctk.CTkButton(win, text="Tester & Sauvegarder", fg_color="#10B981", command=save_smtp).pack(pady=10)
+
     def validate_step_6(self):
-        # 1. Récupérer les canaux
-        selected_channels = []
-        if self.chk_discord.get() == 1: selected_channels.append("Discord")
-        if self.chk_email.get() == 1: selected_channels.append("Email")
-        if self.chk_slack.get() == 1: selected_channels.append("Slack")
-
-        if not selected_channels:
-            messagebox.showwarning("Attention", "Veuillez sélectionner au moins un canal de diffusion.")
-            return
-
-        # 2. Vérifier le validateur
-        validator = self.entry_validator.get().strip()
-        if not validator:
-            self.entry_validator.configure(border_color="red")
-            messagebox.showwarning("Attention", "Un superviseur est obligatoire.")
-            return
-
-        # 3. Vérifier la case sécurité
-        if self.chk_security.get() != "accepted":
-            self.chk_security.configure(text_color="red")
-            messagebox.showerror("Sécurité", "Vous devez accepter la règle de destruction automatique pour continuer.")
-            return
-
-        # Sauvegarde
-        self.config["output_channels"] = selected_channels
-        self.config["validator_contact"] = validator
-        self.config["security_autodelete"] = True
-
-        print(f"✅ OUTPUT: {selected_channels} -> {validator}")
+        # 1. Discord
+        discord_url = self.entry_discord_url.get().strip()
+        if self.chk_discord.get() == 1:
+            if "discord" not in discord_url:
+                messagebox.showwarning("Erreur", "URL Discord invalide.")
+                return
+            self.config["output_channels"]["discord_webhook"] = discord_url
         
-        # Passage à l'étape suivante (Planning)
+        # 2. Superviseur
+        sup_email = self.entry_supervisor_email.get().strip()
+        if not sup_email or "@" not in sup_email:
+            messagebox.showwarning("Erreur", "Email du superviseur invalide.")
+            return
+        
+        # Vérif si SMTP configuré
+        if not self.config["supervisor"].get("smtp_config"):
+             messagebox.showwarning("Attention", "Vous n'avez pas configuré le serveur d'envoi d'email (SMTP).\nL'IA ne pourra pas envoyer le lien de validation.")
+             return
+
+        self.config["supervisor"]["email"] = sup_email
+        self.config["security_autodelete"] = (self.chk_security.get() == "accepted")
+
+        print(f"✅ VALIDATION FLOW: Email -> WebPage -> {list(self.config['output_channels'].keys())}")
         self.show_step_7_planning()
+
+    def send_validation_test(self):
+        # 1. Récupération des infos
+        target_email = self.entry_supervisor_email.get().strip()
+        smtp_conf = self.config["supervisor"].get("smtp_config")
+        
+        # --- AJOUT : SAUVEGARDE DE LA CONFIG POUR LE SERVEUR ---
+        discord_url = self.entry_discord_url.get().strip()
+        try:
+            with open("temp_config.json", "w") as f:
+                json.dump({"discord_webhook": discord_url}, f)
+        except Exception as e:
+            print(f"Erreur sauvegarde temp: {e}")
+        # -------------------------------------------------------
+
+        if not target_email or "@" not in target_email:
+            messagebox.showwarning("Erreur", "Veuillez entrer une adresse email valide pour le superviseur.")
+            return
+
+        if not smtp_conf:
+            messagebox.showwarning("Erreur", "Veuillez d'abord configurer le serveur SMTP (Bouton engrenage).")
+            return
+
+        self.btn_test_email.configure(state="disabled", text="Envoi en cours...")
+
+        # 2. Récupération du mot de passe sécurisé (Keyring)
+        try:
+            smtp_pass = keyring.get_password("OpenAura_SMTP", smtp_conf["user"])
+            if not smtp_pass:
+                raise Exception("Mot de passe SMTP introuvable dans le coffre-fort.")
+        except Exception as e:
+            messagebox.showerror("Erreur Keyring", str(e))
+            self.btn_test_email.configure(state="normal", text="📧 Envoyer un rapport factice")
+            return
+
+        # 3. Création du contenu du mail (Exemple réaliste Atman)
+        subject = "🔔 [AURA] Validation Requise : Rapport Hebdomadaire #42"
+        
+        # HTML Body - C'est ici qu'on simule ce que l'IA dirait
+        html_content = f"""
+        <html>
+        <body style="font-family: Arial, sans-serif; color: #333;">
+            <div style="max-width: 600px; margin: auto; border: 1px solid #ddd; border-radius: 10px; overflow: hidden;">
+                <div style="background-color: #0066FF; padding: 20px; color: white;">
+                    <h2 style="margin: 0;">OpenAura Analyst</h2>
+                </div>
+                <div style="padding: 20px;">
+                    <p>Bonjour,</p>
+                    <p>Voici le brouillon du rapport de surveillance pour la période du <b>12/02 au 19/02</b>.</p>
+                    
+                    <div style="background-color: #F3F4F6; padding: 15px; border-left: 4px solid #0066FF; margin: 20px 0;">
+                        <p style="margin-top: 0;"><b>📊 Résumé de l'activité détectée :</b></p>
+                        <p>Cette semaine a été marquée par une forte activité sur le dossier <b>/PROJETS/NATIV</b>. J'ai détecté l'ajout de 3 nouveaux plans PDF pour le prototype "Sèche-serviette V2".</p>
+                        <p>⚠️ <b>Attention :</b> Un fichier <i>"facture_douteuse.exe"</i> a été déposé dans le dossier Public mardi à 14h02. Je recommande une vérification manuelle.</p>
+                    </div>
+
+                    <p>Avant que je ne diffuse ce message à toute l'équipe sur Discord, merci de valider ou corriger le contenu.</p>
+                    
+                    <div style="text-align: center; margin: 30px 0;">
+                        <a href="http://localhost:5000/validate/simulation_token" 
+                           style="background-color: #10B981; color: white; padding: 12px 24px; text-decoration: none; border-radius: 5px; font-weight: bold;">
+                           ✅ Valider et Envoyer
+                        </a>
+                        &nbsp;&nbsp;
+                        <a href="http://localhost:5000/edit/simulation_token" 
+                           style="background-color: #6B7280; color: white; padding: 12px 24px; text-decoration: none; border-radius: 5px; font-weight: bold;">
+                           ✏️ Modifier
+                        </a>
+                    </div>
+                </div>
+                <div style="background-color: #F9FAFB; padding: 15px; text-align: center; font-size: 12px; color: #6B7280;">
+                    Généré localement par OpenAura @ Atman Manufacture<br>
+                    Ceci est un test de configuration.
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+
+        # 4. Envoi réel
+        threading.Thread(target=self._run_send_thread, args=(smtp_conf, smtp_pass, target_email, subject, html_content)).start()
+
+    def _run_send_thread(self, conf, password, to_email, subject, html):
+        try:
+            msg = MIMEMultipart()
+            msg['From'] = conf["user"]
+            msg['To'] = to_email
+            msg['Subject'] = subject
+            msg.attach(MIMEText(html, 'html'))
+
+            server = smtplib.SMTP(conf["server"], int(conf["port"]))
+            server.starttls()
+            server.login(conf["user"], password)
+            server.send_message(msg)
+            server.quit()
+
+            self.after(0, lambda: messagebox.showinfo("Succès", f"Email envoyé à {to_email} !\nVérifiez votre boîte de réception."))
+        except Exception as e:
+            self.after(0, lambda: messagebox.showerror("Erreur SMTP", f"Échec de l'envoi :\n{e}"))
+        finally:
+            self.after(0, lambda: self.btn_test_email.configure(state="normal", text="📧 Envoyer un rapport factice"))
 
     # =========================================================================
     # ÉTAPE 7 : LE PLANNING (SCHEDULER)
@@ -803,53 +1044,170 @@ class WizardApp(ctk.CTk):
         self.show_final_step_installation()
 
     # =========================================================================
-    # ÉTAPE FINALE : INITIALISATION (Simulation)
+    # ÉTAPE FINALE : INSTALLATION RÉELLE (Ollama + Modèle)
     # =========================================================================
     def show_final_step_installation(self):
         self.clear_frame()
-        self.create_header("FIN", "Initialisation du Système", "OpenAura configure votre environnement...")
+        self.create_header("INSTALLATION", "Initialisation du Système", "Veuillez patienter pendant la configuration...")
 
-        # Console de log
+        # Console de log (Style Terminal)
         self.console = ctk.CTkTextbox(self.main_frame, width=700, height=400, font=("Consolas", 12), 
-                                      text_color="#10B981", fg_color="#000000") # Look Terminal Matrix
+                                      text_color="#10B981", fg_color="#000000")
         self.console.pack(pady=20)
         
-        self.console.insert("0.0", "> Initialisation du noyau OpenAura...\n")
-        self.console.insert("end", f"> Profil Entreprise : {self.config.get('company_name')}\n")
+        self.console.insert("0.0", "> Démarrage du processus d'installation OpenAura...\n")
 
-        # Barre de progression globale
+        # Barre de progression
         self.progress_inst = ctk.CTkProgressBar(self.main_frame, width=600, height=20, progress_color="#0066FF")
         self.progress_inst.set(0)
         self.progress_inst.pack(pady=20)
 
-        # Lancement Thread
-        threading.Thread(target=self.run_final_install_logic).start()
-
-    def run_final_install_logic(self):
-        # Simulation des étapes finales
-        steps = [
-            "Génération du fichier de configuration JSON...",
-            "Chiffrement des identifiants dans Windows Credential Manager...",
-            "Vérification de la présence d'Ollama...",
-            "Initialisation de la base de données SQLite (WAL Mode)...",
-            "Création des Watchdogs sur les dossiers cibles...",
-            "Téléchargement du modèle IA (Simulation)...",
-            "Démarrage du service 'Sentinelle'...",
-        ]
-
-        for i, step in enumerate(steps):
-            time.sleep(1.2) # Temps pour lire
-            self.console.insert("end", f"> {step} [OK]\n")
-            self.console.see("end")
-            self.progress_inst.set((i + 1) / len(steps))
-
-        self.console.insert("end", "\n> ✨ INSTALLATION TERMINÉE AVEC SUCCÈS.\n")
-        
-        # Bouton quitter / lancer
+        # Bouton (Caché au début)
         self.btn_finish = ctk.CTkButton(self.main_frame, text="Ouvrir le Tableau de Bord", 
                                         fg_color="#10B981", height=50, font=("Arial", 16, "bold"),
-                                        command=self.destroy) # Ferme le wizard
-        self.after(0, lambda: self.btn_finish.pack(pady=20))
+                                        command=self.destroy)
+
+        # Lancement du Thread principal
+        threading.Thread(target=self.run_real_installation).start()
+
+    def log(self, message):
+        """Ajoute une ligne dans la console et scroll en bas"""
+        self.console.insert("end", f"> {message}\n")
+        self.console.see("end")
+
+    def run_real_installation(self):
+        try:
+            # --- 1. SAUVEGARDE DE LA CONFIG JSON ---
+            self.log("Sauvegarde de la configuration locale...")
+            self.progress_inst.set(0.1)
+            
+            config_path = "OpenAuraConfig.json"
+            
+            # On nettoie les objets non sérialisables avant de sauvegarder
+            clean_config = self.config.copy()
+            
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump(clean_config, f, indent=4, ensure_ascii=False)
+            
+            self.log(f"Fichier {config_path} généré avec succès.")
+            time.sleep(1)
+
+            # --- 2. VÉRIFICATION OLLAMA ---
+            self.log("Vérification du moteur IA (Ollama)...")
+            self.progress_inst.set(0.2)
+            
+            ollama_path = shutil.which("ollama")
+            
+            if ollama_path:
+                self.log(f"✅ Ollama détecté : {ollama_path}")
+            else:
+                self.log("⚠️ Ollama n'est pas installé.")
+                self.install_ollama() # Lance l'installation
+
+            # --- 3. TÉLÉCHARGEMENT DU MODÈLE CHOISI ---
+            # Récupération du tag technique (ex: moondream, llama3.2-vision, qwen2-vl)
+            # On regarde ce qui a été choisi à l'étape 3, sinon on prend le recommandé
+            
+            selected_model_tag = self.config.get("selected_model_tag")
+            if not selected_model_tag:
+                # Fallback si l'utilisateur n'a pas cliqué explicitement (ex: mode auto)
+                specs = self.config.get("hardware_specs", {})
+                rec_id = specs.get("rec_id", "tiny")
+                
+                mapping = {
+                    "tiny": "moondream",
+                    "medium": "qwen2-vl",
+                    "big": "llama3.2-vision"
+                }
+                selected_model_tag = mapping.get(rec_id, "moondream")
+
+            self.log(f"Préparation du téléchargement du modèle : {selected_model_tag.upper()}")
+            self.log("Cette opération peut prendre plusieurs minutes selon votre connexion...")
+            self.progress_inst.set(0.4)
+            
+            self.pull_ollama_model(selected_model_tag)
+
+            # --- 4. FINALISATION ---
+            self.progress_inst.set(1.0)
+            self.log("✨ INSTALLATION TERMINÉE AVEC SUCCÈS !")
+            self.log("Le service sentinelle est prêt à être lancé.")
+            
+            # Afficher le bouton final
+            self.after(0, lambda: self.btn_finish.pack(pady=20))
+
+        except Exception as e:
+            self.log(f"❌ ERREUR CRITIQUE : {str(e)}")
+            messagebox.showerror("Erreur Installation", str(e))
+
+    def install_ollama(self):
+        """Télécharge et lance l'installeur Ollama pour Windows"""
+        self.log("📥 Téléchargement de OllamaSetup.exe...")
+        url = "https://ollama.com/download/OllamaSetup.exe"
+        installer_name = "OllamaSetup.exe"
+        
+        try:
+            response = requests.get(url, stream=True)
+            with open(installer_name, 'wb') as f:
+                shutil.copyfileobj(response.raw, f)
+            
+            self.log("Lancement de l'installeur...")
+            self.log("⚠️ Veuillez suivre les instructions à l'écran (Cliquez sur Install).")
+            
+            # Lancement bloquant (on attend que l'user finisse)
+            subprocess.run([installer_name], check=True)
+            
+            self.log("Installation terminée. Vérification...")
+            time.sleep(2)
+            if shutil.which("ollama"):
+                self.log("✅ Ollama est maintenant installé et actif.")
+            else:
+                raise Exception("Ollama ne semble toujours pas installé après l'exécution.")
+                
+        except Exception as e:
+            raise Exception(f"Échec de l'installation d'Ollama : {e}")
+
+    def pull_ollama_model(self, model_tag):
+        """Exécute 'ollama pull' et lit la sortie pour animer la console"""
+        try:
+            # Sous Windows, il faut cacher la fenêtre console noire qui pourrait apparaître
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            
+            process = subprocess.Popen(
+                ["ollama", "pull", model_tag],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, # Ollama écrit souvent la progress bar dans stderr
+                text=True,
+                startupinfo=startupinfo,
+                encoding="utf-8" # Important pour les caractères spéciaux
+            )
+            
+            self.log(f"Commande envoyée : ollama pull {model_tag}")
+            
+            # Lecture en temps réel
+            while True:
+                output = process.stderr.readline() # Ollama utilise stderr pour les barres de progression
+                if output == '' and process.poll() is not None:
+                    break
+                if output:
+                    clean_line = output.strip()
+                    if clean_line:
+                        # On affiche pas tout pour pas spammer, juste les pourcentages ou infos
+                        if "downloading" in clean_line or "%" in clean_line or "verifying" in clean_line:
+                            # On met à jour la dernière ligne de la console au lieu d'ajouter
+                            # Astuce : supprimer la dernière ligne et réécrire pour effet animation
+                            # Mais pour faire simple ici, on log juste
+                            self.console.insert("end", f"{clean_line}\n")
+                            self.console.see("end")
+            
+            if process.returncode == 0:
+                self.log(f"✅ Modèle {model_tag} téléchargé et prêt.")
+            else:
+                raise Exception(f"Erreur lors du pull (Code {process.returncode})")
+
+        except FileNotFoundError:
+             # Si ollama n'est pas trouvé malgré l'install
+             raise Exception("Commande 'ollama' introuvable. Redémarrez le logiciel.")
 
 if __name__ == "__main__":
     app = WizardApp()
