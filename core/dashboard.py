@@ -6,18 +6,27 @@ import sqlite3
 import time
 import requests
 import subprocess
+import sys
+import base64
+import queue
 from bs4 import BeautifulSoup
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from datetime import datetime
+import pypdf
 
 # --- CONFIGURATION GRAPHIQUE ---
 ctk.set_appearance_mode("Light")
 ctk.set_default_color_theme("blue")
 
-# Calcul de la racine du projet pour les chemins absolus (Gestion robuste des chemins)
-ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CONFIG_FILE = os.path.join(ROOT_DIR, "OpenAuraConfig.json")
+# --- CHEMINS ---
+if getattr(sys, 'frozen', False):
+    BASE_DIR = os.path.dirname(sys.executable)
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+CONFIG_FILE = os.path.join(BASE_DIR, "OpenAuraConfig.json")
+DB_PATH = os.path.join(BASE_DIR, "aura_memory.db")
 OLLAMA_API_URL = "http://localhost:11434/api/generate"
 
 # =============================================================================
@@ -27,10 +36,17 @@ class AuraBrain:
     def __init__(self, log_callback):
         self.log = log_callback
         self.config = self.load_config()
-        self.db_path = os.path.join(ROOT_DIR, "aura_memory.db")
+        self.db_path = DB_PATH
         self.observers = []
         
+        # File d'attente pour l'analyse (Optimisation Snapshot)
+        self.analysis_queue = queue.Queue()
+        self.stop_event = threading.Event()
+        
         self.init_db()
+        
+        # Démarrage du Worker d'analyse (Tâche de fond)
+        threading.Thread(target=self.worker_analysis_loop, daemon=True).start()
 
     def load_config(self):
         if os.path.exists(CONFIG_FILE):
@@ -46,38 +62,49 @@ class AuraBrain:
             self.log(f"❌ Erreur sauvegarde config : {e}")
 
     def init_db(self):
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS file_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT,
-                event_type TEXT,
-                file_path TEXT
-            )
-        ''')
-        conn.commit()
-        conn.close()
-        self.log("🧠 Mémoire SQLite initialisée (Mode WAL).")
+        """Crée la BDD et met à jour le schéma pour le Snapshot"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            # Création table standard
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS file_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT,
+                    event_type TEXT,
+                    file_path TEXT,
+                    content_summary TEXT  -- Nouvelle colonne pour le Snapshot
+                )
+            ''')
+            
+            # Migration : Ajout de la colonne si elle manque (pour les anciens utilisateurs)
+            try:
+                cursor.execute("ALTER TABLE file_events ADD COLUMN content_summary TEXT")
+            except sqlite3.OperationalError:
+                pass # La colonne existe déjà
 
-    # --- GESTION DU MOTEUR IA (AUTO-START) ---
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_filepath ON file_events (file_path)")
+            conn.commit()
+            conn.close()
+            self.log(f"🧠 Mémoire connectée (Snapshot Ready).")
+        except Exception as e:
+            self.log(f"❌ ERREUR CRITIQUE BDD : {e}")
+
     def ensure_ollama_ready(self):
-        """Vérifie si Ollama tourne. Si non, le lance en mode caché."""
         url = "http://localhost:11434"
         try:
             requests.get(url, timeout=0.5)
             return True
         except requests.exceptions.ConnectionError:
             self.log("⚠️ Le moteur IA est éteint. Démarrage automatique...")
-
         try:
             startupinfo = subprocess.STARTUPINFO()
             startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             subprocess.Popen(["ollama", "serve"], startupinfo=startupinfo, creationflags=0x08000000, 
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            
             self.log("⏳ Initialisation du moteur neuronal...")
-            for i in range(10):
+            for i in range(15):
                 time.sleep(1)
                 try:
                     requests.get(url, timeout=0.5)
@@ -89,66 +116,148 @@ class AuraBrain:
             self.log(f"❌ Erreur lancement Ollama : {e}")
             return False
 
-    # --- SCRAPING & INTELLIGENCE ---
+    # --- WORKER D'ANALYSE (SNAPSHOT) ---
+    def worker_analysis_loop(self):
+        """Boucle infinie qui traite les fichiers en attente d'analyse"""
+        while not self.stop_event.is_set():
+            try:
+                # On attend un fichier (timeout 1s pour vérifier stop_event)
+                event_id, file_path, event_type = self.analysis_queue.get(timeout=1)
+                
+                # Si c'est une suppression, on ne peut rien analyser (trop tard)
+                if event_type == "🗑️ SUPPRIMÉ":
+                    self.analysis_queue.task_done()
+                    continue
+
+                self.log(f"👁️ Analyse approfondie : {os.path.basename(file_path)}")
+                
+                # 1. Extraction du contenu (OCR / Vision / Texte)
+                content = self.analyze_file_content(file_path)
+                
+                # 2. Mise à jour de la BDD (Snapshot)
+                if content:
+                    self.update_db_snapshot(event_id, content)
+                    self.log(f"💾 Snapshot enregistré pour {os.path.basename(file_path)}")
+                
+                self.analysis_queue.task_done()
+                
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"Erreur Worker: {e}")
+
+    def update_db_snapshot(self, event_id, content):
+        try:
+            conn = sqlite3.connect(self.db_path, timeout=10)
+            cursor = conn.cursor()
+            cursor.execute("UPDATE file_events SET content_summary = ? WHERE id = ?", (content, event_id))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"Erreur Update DB: {e}")
+
+    def analyze_file_content(self, path):
+        """Détecte le type et lance l'analyse appropriée (Vision/Text)"""
+        if not os.path.exists(path): return "[Fichier inaccessible]"
+        
+        ext = os.path.splitext(path)[1].lower()
+        
+        # --- CAS 1 : IMAGES (VISION + OCR) ---
+        if ext in [".jpg", ".jpeg", ".png", ".bmp", ".webp"]:
+            return self._analyze_image_with_vision(path)
+
+        # --- CAS 2 : PDF ---
+        if ext == ".pdf":
+            try:
+                reader = pypdf.PdfReader(path)
+                text = ""
+                for i in range(min(3, len(reader.pages))): # Max 3 pages
+                    text += reader.pages[i].extract_text()
+                return "CONTENU PDF : " + text[:1500].replace("\n", " ")
+            except:
+                return "[Erreur lecture PDF]"
+
+        # --- CAS 3 : TEXTE BRUT ---
+        valid_exts = [".txt", ".md", ".py", ".json", ".html", ".css", ".csv", ".xml", ".ini", ".log"]
+        if ext in valid_exts:
+            try:
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    return "CONTENU TEXTE : " + f.read(2000).replace("\n", " ")
+            except: return "[Erreur lecture Texte]"
+            
+        return "[Type de fichier non analysable]"
+
+    def _analyze_image_with_vision(self, image_path):
+        """Envoie l'image à Llama-3.2-Vision via API Ollama"""
+        if not self.ensure_ollama_ready(): return "[IA non dispo]"
+        
+        try:
+            # Encodage Base64
+            with open(image_path, "rb") as f:
+                img_bytes = f.read()
+                img_b64 = base64.b64encode(img_bytes).decode('utf-8')
+
+            model = "llama3.2-vision" # Force le modèle Vision
+            
+            prompt = """Analyze this image in detail. 
+            1. If there is text (OCR), transcribe it exactly.
+            2. Describe the visual content (objects, diagrams).
+            3. Summarize the purpose of this document/image."""
+
+            payload = {
+                "model": model,
+                "prompt": prompt,
+                "stream": False,
+                "images": [img_b64]
+            }
+            
+            response = requests.post(OLLAMA_API_URL, json=payload)
+            if response.status_code == 200:
+                desc = response.json().get("response", "").strip()
+                return f"ANALYSE VISION (OCR) : {desc}"
+            else:
+                return f"[Erreur Vision: {response.text}]"
+
+        except Exception as e:
+            return f"[Erreur Vision Critique: {e}]"
+
+    # --- SCRAPING (Inchangé) ---
     def start_learning_process(self):
         if "scraping_summary" in self.config and self.config["scraping_summary"]:
-            self.log("♻️ Identité entreprise chargée depuis la mémoire.")
+            self.log("♻️ Identité entreprise chargée.")
             return
-
         url = self.config.get("website_url")
-        if url:
-            threading.Thread(target=self._scrape_and_analyze, args=(url,)).start()
-        else:
-            self.log("ℹ️ Pas de site web configuré. Analyse ignorée.")
+        if url: threading.Thread(target=self._scrape_and_analyze, args=(url,)).start()
 
     def _scrape_and_analyze(self, url):
-        self.log(f"🌐 Lecture du site web : {url}...")
+        self.log(f"🌐 Lecture site : {url}...")
         try:
-            headers = {'User-Agent': 'Mozilla/5.0 OpenAuraAI/1.0'}
-            response = requests.get(url, headers=headers, timeout=10)
+            response = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
             if response.status_code == 200:
                 soup = BeautifulSoup(response.text, 'html.parser')
-                raw_text = ""
-                for tag in soup.find_all(['h1', 'h2', 'h3', 'p', 'li']):
-                    text = tag.get_text().strip()
-                    if len(text) > 30: raw_text += text + ". "
-                
-                self.log("🧠 Analyse IA en cours (Synthèse de l'identité)...")
-                self.analyze_company_with_ai(raw_text[:6000])
-        except Exception as e:
-            self.log(f"❌ Erreur scraping : {e}")
+                raw = " ".join([t.get_text().strip() for t in soup.find_all(['h1', 'h2', 'p']) if len(t.get_text()) > 30])
+                self.analyze_company_with_ai(raw[:6000])
+        except Exception as e: self.log(f"❌ Erreur scraping: {e}")
 
     def analyze_company_with_ai(self, raw_text):
         if not self.ensure_ollama_ready(): return
-
-        # Utilisation de selected_model_tag en priorité
-        model = self.config.get("selected_model_tag") or self.config.get("selected_model", "moondream")
-        prompt = f"""Tu es un analyste stratégique expert. Synthétise ceci en une fiche d'identité (Activité, Produits, Valeurs) :
-        {raw_text}"""
-        
+        model = self.config.get("selected_model_tag", "moondream")
         try:
-            payload = {"model": model, "prompt": prompt, "stream": False, "options": {"temperature": 0.3}}
-            response = requests.post(OLLAMA_API_URL, json=payload)
-            if response.status_code == 200:
-                ai_summary = response.json().get("response", "").strip()
-                self.config["scraping_summary"] = ai_summary
+            res = requests.post(OLLAMA_API_URL, json={"model": model, "prompt": f"Synthèse fiche identité entreprise : {raw_text}", "stream": False})
+            if res.status_code == 200:
+                self.config["scraping_summary"] = res.json().get("response", "")
                 self.save_config()
-                self.log("✅ Identité générée et sauvegardée.")
-        except Exception as e:
-            self.log(f"❌ Erreur connexion IA : {e}")
+                self.log("✅ Identité générée.")
+        except: pass
 
-    # --- WATCHDOG (SURVEILLANCE) ---
+    # --- WATCHDOG ---
     def start_watchdogs(self):
         targets = self.config.get("targets", [])
-        if not targets:
-            self.log("⚠️ Aucune cible configurée.")
-            return
-
-        self.log("📂 Inventaire des fichiers existants...")
-        threading.Thread(target=self._perform_initial_scan, args=(targets,)).start()
-
-        self.log(f"👀 Activation des sentinelles sur {len(targets)} zones...")
-        event_handler = AuraFileHandler(self.db_path, self.log)
+        if not targets: return
+        
+        # On passe 'self' au handler pour qu'il puisse accéder à la Queue
+        event_handler = AuraFileHandler(self.db_path, self.log, self.analysis_queue)
+        
         for target in targets:
             path = target["path"]
             if os.path.exists(path):
@@ -156,125 +265,115 @@ class AuraBrain:
                 observer.schedule(event_handler, path, recursive=True)
                 observer.start()
                 self.observers.append(observer)
+                self.log(f"👀 Surveillance : {path}")
 
-    def _perform_initial_scan(self, targets):
-        count = 0
-        for target in targets:
-            path = target["path"]
-            if os.path.exists(path):
-                for root, dirs, files in os.walk(path):
-                    for file in files:
-                        if self._is_ignored(file): continue
-                        count += 1
-                        # On ne log pas tout pour ne pas spammer au démarrage
-        self.log(f"✅ Inventaire terminé : {count} fichiers suivis.")
-
-    def _is_ignored(self, filename):
-        return filename.startswith("~$") or filename.endswith((".tmp", ".log", ".ini", ".db"))
-
-    # --- GÉNÉRATION DE RAPPORT (NOUVEAU) ---
+    # --- GÉNÉRATION DE RAPPORT ---
     def generate_report(self, on_complete_callback):
-        """Logique principale de génération"""
         threading.Thread(target=self._run_report_generation, args=(on_complete_callback,)).start()
 
     def _run_report_generation(self, callback):
         if not self.ensure_ollama_ready(): return
+        self.log("📝 Compilation du rapport avec les Snapshots...")
 
-        self.log("📝 Récupération des logs d'activité...")
+        events_data = ""
         
-        # 1. Récupérer les événements depuis la BDD
-        events_text = ""
         try:
-            conn = sqlite3.connect(self.db_path)
+            conn = sqlite3.connect(self.db_path, timeout=10)
             cursor = conn.cursor()
-            # On prend les 50 derniers événements pour l'exemple
-            cursor.execute("SELECT timestamp, event_type, file_path FROM file_events ORDER BY id DESC LIMIT 50")
+            # On récupère TOUT : timestamp, type, nom, et surtout LE CONTENU DÉJÀ ANALYSÉ
+            cursor.execute("SELECT timestamp, event_type, file_path, content_summary FROM file_events ORDER BY timestamp DESC LIMIT 30")
             rows = cursor.fetchall()
             conn.close()
 
             if not rows:
-                self.log("⚠️ Aucune activité récente détectée.")
-                callback("Rien à signaler. Le calme plat capitaine !")
+                callback("Rien à signaler.")
                 return
 
+            self.log(f"📊 Utilisation de {len(rows)} événements mémorisés...")
+
             for row in rows:
-                # On nettoie le chemin pour ne garder que le nom du fichier et le dossier parent
-                path = row[2]
-                folder = os.path.basename(os.path.dirname(path))
-                filename = os.path.basename(path)
-                events_text += f"- {row[0]} : [{row[1]}] {folder}/{filename}\n"
+                ts, ev_type, fpath, content = row
+                fname = os.path.basename(fpath)
+                
+                # Si le contenu est vide (ex: suppression sans analyse préalable ou fichier ignoré)
+                if not content: content = "[Pas de contenu analysé disponible]"
+                
+                events_data += f"""
+                --- ÉVÉNEMENT ---
+                Heure : {ts}
+                Action : {ev_type}
+                Fichier : {fname}
+                CONTENU ANALYSÉ (SNAPSHOT) : 
+                {content}
+                -----------------
+                """
 
         except Exception as e:
-            self.log(f"❌ Erreur BDD : {e}")
+            self.log(f"❌ Erreur Data: {e}")
             return
 
-        # 2. Préparer le contexte
-        company_context = self.config.get("scraping_summary", "Entreprise inconnue")
-        personality = self.config.get("system_prompt_style", "balanced_professional")
+        company_context = self.config.get("scraping_summary", "Non défini")
         
-        # Définition du ton selon la config du Wizard
-        tone_instruction = "Tu es factuel, précis et analytique."
-        if personality == "casual_engaging":
-            tone_instruction = "Tu es chaleureux, utilise des émojis et un ton 'équipe/coach'."
-        elif personality == "balanced_professional":
-            tone_instruction = "Tu es professionnel mais accessible."
-
-        # 3. Le Prompt Ultime
         prompt = f"""
+        Tu es l'Analyste IA de l'entreprise.
+        
         CONTEXTE ENTREPRISE :
         {company_context}
 
-        TON RÔLE :
-        {tone_instruction}
-        Tu dois rédiger un rapport d'activité court pour l'équipe.
+        HISTORIQUE DES FICHIERS (AVEC ANALYSE DE CONTENU/OCR) :
+        {events_data}
 
-        ACTIVITÉ DÉTECTÉE (LOGS BRUTS) :
-        {events_text}
-
-        INSTRUCTIONS :
-        1. Résume ce qui s'est passé (nouveaux fichiers, suppressions).
-        2. Essaie de deviner sur quel projet l'équipe travaille vu les noms des fichiers.
-        3. Si tu vois des fichiers suspects (exe, tmp), alerte.
-        4. Ne liste pas tout ligne par ligne, fais une synthèse intelligente.
+        MISSION :
+        Rédige un rapport synthétique en Français.
+        1. Base-toi sur le "CONTENU ANALYSÉ" pour expliquer ce qui a été fait (ex: "Ajout d'un plan technique" et pas juste "Ajout fichier.pdf").
+        2. Si des images ont été ajoutées, décris ce qu'elles contiennent grâce à l'analyse OCR fournie.
+        3. Si des fichiers ont été supprimés, mentionne-le simplement.
+        4. Groupe les événements par projet si possible.
         """
 
-        self.log("🤖 Rédaction du rapport par l'IA en cours...")
-        
-        # 4. Appel Ollama
+        self.log("🤖 Rédaction du rapport...")
         try:
-            model = self.config.get("selected_model_tag") or self.config.get("selected_model", "moondream")
+            model = self.config.get("selected_model_tag", "moondream")
+            # Astuce : Si on a Llama 3.2 Vision, on l'utilise aussi pour le texte, il est meilleur
+            if "vision" in model or "llama" in model: model = "llama3.2-vision"
+
             payload = {"model": model, "prompt": prompt, "stream": False}
             response = requests.post(OLLAMA_API_URL, json=payload)
-            
             if response.status_code == 200:
-                report = response.json().get("response", "")
-                self.log("✅ Rapport généré avec succès !")
-                callback(report)
+                callback(response.json().get("response", ""))
+                self.log("✅ Rapport terminé.")
             else:
-                self.log("❌ Erreur de génération.")
-                callback("Erreur lors de la génération du rapport.")
-
+                callback(f"Erreur IA: {response.text}")
         except Exception as e:
-            self.log(f"❌ Erreur critique IA : {e}")
+            self.log(f"❌ Erreur Critique : {e}")
 
-# --- GESTIONNAIRE D'ÉVÉNEMENTS (WATCHDOG) ---
+# --- HANDLER (WATCHDOG) ---
 class AuraFileHandler(FileSystemEventHandler):
-    def __init__(self, db_path, log_callback):
+    def __init__(self, db_path, log_callback, analysis_queue):
         self.db_path = db_path
         self.log = log_callback
+        self.queue = analysis_queue # On récupère la file d'attente
+        self.last_events = {} 
 
     def is_valid(self, path):
         f = os.path.basename(path)
-        if f.startswith("~$") or f.endswith((".tmp", ".log", ".ini", ".db", ".dat")):
-            return False
+        if f.startswith("~$") or f.endswith((".tmp", ".log", ".ini", ".db", ".lnk", ".dat")): return False
         return True
+
+    def _debounce(self, path):
+        curr = time.time()
+        if curr - self.last_events.get(path, 0) < 1.0: return True
+        self.last_events[path] = curr
+        return False
 
     def on_created(self, event):
         if not event.is_directory and self.is_valid(event.src_path):
+            self.last_events[event.src_path] = time.time()
             self.record_event("NOUVEAU", event.src_path)
 
     def on_modified(self, event):
         if not event.is_directory and self.is_valid(event.src_path):
+            if self._debounce(event.src_path): return 
             self.record_event("MODIFIÉ", event.src_path)
 
     def on_deleted(self, event):
@@ -289,116 +388,89 @@ class AuraFileHandler(FileSystemEventHandler):
     def record_event(self, type, display_text, raw_path=None):
         path_to_log = raw_path if raw_path else display_text
         filename = os.path.basename(display_text) if "➡️" not in type else display_text
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
-        # Log Visuel
         self.log(f"📁 [{type}] {filename}")
         
-        # Log Database (Important pour le rapport)
         try:
-            conn = sqlite3.connect(self.db_path)
+            conn = sqlite3.connect(self.db_path, timeout=10)
             cursor = conn.cursor()
+            # On insère l'événement de base (sans content_summary pour l'instant)
             cursor.execute("INSERT INTO file_events (timestamp, event_type, file_path) VALUES (?, ?, ?)",
-                           (timestamp, type, path_to_log))
+                           (ts, type, path_to_log))
+            event_id = cursor.lastrowid
             conn.commit()
             conn.close()
+            
+            # --- OPTIMISATION : ENVOI EN QUEUE POUR ANALYSE IA ---
+            # On n'analyse que les créations et modifs, pas les suppressions (trop tard)
+            if type in ["NOUVEAU", "MODIFIÉ", "DÉPLACÉ"] and path_to_log:
+                self.queue.put((event_id, path_to_log, type))
+                
         except Exception as e:
             print(f"DB Error: {e}")
 
-
-# =============================================================================
-# PARTIE 2 : LE TABLEAU DE BORD (FRONTEND)
-# =============================================================================
+# --- FRONTEND (DASHBOARD) ---
 class DashboardApp(ctk.CTk):
     def __init__(self):
         super().__init__()
-
         self.title("OpenAura - Dashboard")
         self.geometry("1100x700")
-        
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
 
-        # --- SIDEBAR ---
         self.sidebar = ctk.CTkFrame(self, width=220, corner_radius=0)
         self.sidebar.grid(row=0, column=0, sticky="nsew")
-        
         self.logo_label = ctk.CTkLabel(self.sidebar, text="OpenAura", font=ctk.CTkFont(size=22, weight="bold"))
         self.logo_label.pack(padx=20, pady=(20, 10))
-        
         status_frame = ctk.CTkFrame(self.sidebar, fg_color="#DCFCE7", border_color="#10B981", border_width=1)
         status_frame.pack(padx=10, pady=10, fill="x")
         ctk.CTkLabel(status_frame, text="✅ ONLINE", text_color="#15803D", font=("Arial", 12, "bold")).pack(pady=5)
-
-        # Boutons Menu
-        ctk.CTkButton(self.sidebar, text="Vue d'ensemble", fg_color="#3B82F6").pack(padx=20, pady=10, fill="x")
         
-        # BOUTON GÉNÉRER RAPPORT
-        self.btn_generate = ctk.CTkButton(self.sidebar, text="⚡ Générer Rapport", 
-                                          fg_color="#EF4444", hover_color="#DC2626", 
-                                          command=self.action_generate_report)
+        ctk.CTkButton(self.sidebar, text="Vue d'ensemble", fg_color="#3B82F6").pack(padx=20, pady=10, fill="x")
+        self.btn_generate = ctk.CTkButton(self.sidebar, text="⚡ Générer Rapport", fg_color="#EF4444", hover_color="#DC2626", command=self.action_generate_report)
         self.btn_generate.pack(padx=20, pady=20, fill="x")
 
-        # --- MAIN VIEW ---
         self.main_view = ctk.CTkFrame(self, corner_radius=0, fg_color="white")
         self.main_view.grid(row=0, column=1, sticky="nsew", padx=20, pady=20)
-        
-        # Titre + Console
         ctk.CTkLabel(self.main_view, text="Activité en Temps Réel", font=("Arial", 20, "bold"), text_color="#111827").pack(anchor="w", pady=(0, 10))
 
-        self.console = ctk.CTkTextbox(self.main_view, width=800, height=400, font=("Consolas", 12), 
-                                      fg_color="#1E1E1E", text_color="#10B981")
+        self.console = ctk.CTkTextbox(self.main_view, width=800, height=400, font=("Consolas", 12), fg_color="#1E1E1E", text_color="#10B981")
         self.console.pack(fill="both", expand=True, pady=(0, 20))
 
-        # Zone de résultat du rapport (Popup interne)
         self.report_frame = ctk.CTkFrame(self.main_view, fg_color="#F3F4F6", corner_radius=10, border_color="#D1D5DB", border_width=1)
         self.report_frame.pack(fill="x", ipady=10)
-        self.report_frame.pack_forget() # Caché par défaut
-
-        self.lbl_report_title = ctk.CTkLabel(self.report_frame, text="📝 Dernier Rapport Généré", font=("Arial", 14, "bold"), text_color="#374151")
-        self.lbl_report_title.pack(anchor="w", padx=20, pady=(10, 0))
-        
+        self.report_frame.pack_forget() 
         self.report_text_box = ctk.CTkTextbox(self.report_frame, height=150, fg_color="white", text_color="black")
         self.report_text_box.pack(fill="x", padx=20, pady=10)
 
-        # Initialisation du cerveau
         self.brain = AuraBrain(self.log_to_console)
         self.after(1000, self.start_automation)
 
     def log_to_console(self, message):
-        def _write():
-            timestamp = datetime.now().strftime("[%H:%M:%S]")
-            self.console.insert("end", f"{timestamp} {message}\n")
-            self.console.see("end")
-        self.after(0, _write)
+        self.after(0, lambda: self._safe_log(message))
+    def _safe_log(self, message):
+        ts = datetime.now().strftime("[%H:%M:%S]")
+        self.console.insert("end", f"{ts} {message}\n")
+        self.console.see("end")
 
     def start_automation(self):
-        self.log_to_console("🚀 Démarrage du Dashboard...")
+        self.log_to_console("🚀 Démarrage...")
         self.brain.ensure_ollama_ready()
         self.brain.start_learning_process()
         self.brain.start_watchdogs()
-        
-        model = self.brain.config.get("selected_model_tag") or self.brain.config.get("selected_model", "Inconnu")
-        self.log_to_console(f"🤖 Modèle IA actif : {model}")
 
     def action_generate_report(self):
         self.btn_generate.configure(state="disabled", text="Analyse en cours...")
-        self.report_frame.pack_forget() # Cacher l'ancien
-        
-        # Callback appelé quand l'IA a fini
-        def on_report_ready(report_text):
-            self.after(0, lambda: self._display_report(report_text))
-
-        self.brain.generate_report(on_report_ready)
+        self.report_frame.pack_forget()
+        self.brain.generate_report(lambda r: self.after(0, lambda: self._display_report(r)))
 
     def _display_report(self, text):
         self.btn_generate.configure(state="normal", text="⚡ Générer Rapport")
-        
-        # Afficher la zone de rapport
         self.report_frame.pack(fill="x", ipady=10, pady=10)
         self.report_text_box.delete("0.0", "end")
         self.report_text_box.insert("0.0", text)
-        self.log_to_console("📄 Nouveau rapport disponible (voir bas de page).")
+        self.log_to_console("📄 Rapport affiché.")
 
 if __name__ == "__main__":
     app = DashboardApp()
