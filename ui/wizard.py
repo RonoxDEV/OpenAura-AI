@@ -31,6 +31,7 @@ from email.mime.multipart import MIMEMultipart
 import json
 import subprocess
 import shutil
+import sys
 
 # Gestion de WMI uniquement pour Windows
 try:
@@ -57,8 +58,17 @@ class WizardApp(ctk.CTk):
         self.grid_rowconfigure(0, weight=1)
 
         # --- 2. DATA ---
+        # Gestion des chemins pour dev et production (PyInstaller)
         current_dir = os.path.dirname(os.path.abspath(__file__))
-        self.assets_path = os.path.join(current_dir, "assets")
+
+        # Si bundlé avec PyInstaller
+        if getattr(sys, 'frozen', False):
+            # Mode production (exécutable)
+            base_dir = sys._MEIPASS
+            self.assets_path = os.path.join(base_dir, "ui", "assets")
+        else:
+            # Mode développement
+            self.assets_path = os.path.join(current_dir, "assets")
 
         self.config = {
             "install_type": None,
@@ -368,7 +378,7 @@ class WizardApp(ctk.CTk):
             {
                 "id": "tiny",
                 "name": "Moondream2 (1.8B)",
-                "tag": "moondream",
+                "tag": "moondream2",
                 "desc": "⚡ Ultra-Rapide & Léger.\nIdéal pour décrire des images simplement.\nPeu précis sur les longs textes.",
                 "req": "VRAM: < 3 GB (OK CPU)"
             },
@@ -1088,25 +1098,39 @@ class WizardApp(ctk.CTk):
         threading.Thread(target=self.run_real_installation).start()
 
     def log(self, message):
-        """Ajoute une ligne dans la console et scroll en bas"""
-        self.console.insert("end", f"> {message}\n")
-        self.console.see("end")
+        """Ajoute une ligne dans la console et scroll en bas (thread-safe)"""
+        def _do_log():
+            self.console.insert("end", f"> {message}\n")
+            self.console.see("end")
+        self.after(0, _do_log)
 
     def run_real_installation(self):
         try:
             # --- 1. SAUVEGARDE DE LA CONFIG JSON ---
             self.log("Sauvegarde de la configuration locale...")
             self.progress_inst.set(0.1)
-            
-            config_path = "OpenAuraConfig.json"
-            
+
+            # Créer le dossier .OpenAura à la racine du PC (home directory)
+            home_dir = os.path.expanduser("~")
+            config_dir = os.path.join(home_dir, ".OpenAura")
+
+            if not os.path.exists(config_dir):
+                os.makedirs(config_dir)
+                self.log(f"Dossier créé : {config_dir}")
+
+            # Récupérer le nom de l'entreprise pour nommer le fichier config
+            company_name = self.config.get("company_name", "OpenAura")
+            config_filename = f"{company_name}.OpenAuraConfig.json"
+            config_path = os.path.join(config_dir, config_filename)
+
             # On nettoie les objets non sérialisables avant de sauvegarder
             clean_config = self.config.copy()
-            
+
             with open(config_path, "w", encoding="utf-8") as f:
                 json.dump(clean_config, f, indent=4, ensure_ascii=False)
-            
-            self.log(f"Fichier {config_path} généré avec succès.")
+
+            self.log(f"Fichier {config_filename} généré avec succès.")
+            self.log(f"Chemin : {config_path}")
             time.sleep(1)
 
             # --- 2. VÉRIFICATION OLLAMA ---
@@ -1130,17 +1154,15 @@ class WizardApp(ctk.CTk):
                 # Fallback si l'utilisateur n'a pas cliqué explicitement (ex: mode auto)
                 specs = self.config.get("hardware_specs", {})
                 rec_id = specs.get("rec_id", "tiny")
-                
+
                 mapping = {
-                    "tiny": "moondream",
+                    "tiny": "moondream2",
                     "medium": "qwen2-vl",
                     "big": "llama3.2-vision"
                 }
-                selected_model_tag = mapping.get(rec_id, "moondream")
+                selected_model_tag = mapping.get(rec_id, "moondream2")
 
-            self.log(f"Préparation du téléchargement du modèle : {selected_model_tag.upper()}")
-            self.log("Cette opération peut prendre plusieurs minutes selon votre connexion...")
-            self.progress_inst.set(0.4)
+            
             
             self.pull_ollama_model(selected_model_tag)
 
@@ -1157,31 +1179,122 @@ class WizardApp(ctk.CTk):
             messagebox.showerror("Erreur Installation", str(e))
 
     def install_ollama(self):
-        """Télécharge et lance l'installeur Ollama pour Windows"""
+        """Télécharge et installe Ollama avec barre de progression"""
         self.log("📥 Téléchargement de OllamaSetup.exe...")
         url = "https://ollama.com/download/OllamaSetup.exe"
-        installer_name = "OllamaSetup.exe"
-        
+
         try:
+            self.log("⚠️ Veuillez patienter pendant le téléchargement et l'installation de Ollama.")
+
+            # Télécharger dans le répertoire temp
+            import tempfile
+            temp_dir = tempfile.gettempdir()
+            installer_path = os.path.join(temp_dir, "OllamaSetup.exe")
+
+            # Télécharger avec barre de progression
             response = requests.get(url, stream=True)
-            with open(installer_name, 'wb') as f:
-                shutil.copyfileobj(response.raw, f)
-            
+            total_size = int(response.headers.get('content-length', 0))
+
+            if total_size == 0:
+                self.log("⚠️ Impossible de déterminer la taille du fichier.")
+                total_size = 150 * 1024 * 1024  # Estimation 150MB
+
+            downloaded = 0
+            chunk_size = 8192
+            start_time = time.time()
+
+            with open(installer_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=chunk_size):
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+
+                        # Calcul de la barre de progression
+                        progress = downloaded / total_size
+                        bars = int(progress * 40)
+                        percentage = int(progress * 100)
+
+                        # Temps écoulé et vitesse
+                        elapsed = time.time() - start_time
+                        if elapsed > 0:
+                            speed = downloaded / elapsed / 1024 / 1024  # MB/s
+                            remaining = (total_size - downloaded) / (downloaded / elapsed) if elapsed > 0 else 0
+                            remaining_str = self._format_time(remaining)
+                        else:
+                            speed = 0
+                            remaining_str = "Calcul..."
+
+                        # Afficher la barre
+                        bar = "█" * bars + "░" * (40 - bars)
+                        size_mb = total_size / 1024 / 1024
+                        downloaded_mb = downloaded / 1024 / 1024
+
+                        msg = f"[{bar}] {percentage}% | {downloaded_mb:.1f}/{size_mb:.1f} MB | {speed:.1f} MB/s | ETA: {remaining_str}"
+
+                        # Mettre à jour la console (remplacer la dernière ligne)
+                        self.after(0, lambda msg=msg: self._update_last_log(msg))
+
+            self.log("✅ Téléchargement terminé !")
             self.log("Lancement de l'installeur...")
-            self.log("⚠️ Veuillez suivre les instructions à l'écran (Cliquez sur Install).")
-            
-            # Lancement bloquant (on attend que l'user finisse)
-            subprocess.run([installer_name], check=True)
-            
-            self.log("Installation terminée. Vérification...")
-            time.sleep(2)
-            if shutil.which("ollama"):
-                self.log("✅ Ollama est maintenant installé et actif.")
-            else:
-                raise Exception("Ollama ne semble toujours pas installé après l'exécution.")
-                
+
+            # Lancer l'installeur en arrière-plan
+            subprocess.Popen([installer_path])
+
+            self.log("⚠️ Veuillez suivre les instructions d'installation.")
+            self.log("En attente de l'installation (cela peut prendre plusieurs minutes)...")
+
+            # Vérifier pendant 15 minutes si Ollama s'installe
+            for i in range(180):  # 180 tentatives x 5 secondes = 15 minutes
+                time.sleep(5)
+
+                # Vérifier dans le PATH
+                if shutil.which("ollama"):
+                    self.log("✅ Ollama détecté ! Installation réussie.")
+                    return
+
+                # Vérifier dans le chemin d'installation par défaut de Windows
+                default_path = os.path.expanduser("~\\AppData\\Local\\Programs\\Ollama\\ollama.exe")
+                if os.path.exists(default_path):
+                    self.log("✅ Ollama installé avec succès !")
+                    # Ajouter au PATH
+                    ollama_bin_path = os.path.dirname(default_path)
+                    os.environ['PATH'] = ollama_bin_path + os.pathsep + os.environ.get('PATH', '')
+                    return
+
+            self.log("⏱️ Timeout - Ollama n'a pas pu être détecté.")
+            self.log("⚠️ Veuillez installer Ollama manuellement depuis https://ollama.com/download")
+
         except Exception as e:
-            raise Exception(f"Échec de l'installation d'Ollama : {e}")
+            self.log(f"⚠️ Erreur : {e}")
+            self.log("Tentative d'utilisation de Ollama existant...")
+
+    def _format_time(self, seconds):
+        """Formate le temps en format lisible"""
+        if seconds < 0 or seconds > 3600:
+            return "Calcul..."
+        if seconds < 60:
+            return f"{int(seconds)}s"
+        else:
+            mins = int(seconds / 60)
+            secs = int(seconds % 60)
+            return f"{mins}m{secs}s"
+
+    def _update_last_log(self, msg):
+        """Remplace la dernière ligne de la console"""
+        try:
+            # Supprimer la dernière ligne
+            content = self.console.get("1.0", "end-1c")
+            last_newline = content.rfind('\n')
+            if last_newline != -1:
+                self.console.delete(f"1.0 + {last_newline} chars", "end-1c")
+            else:
+                self.console.delete("1.0", "end-1c")
+
+            # Ajouter la nouvelle ligne
+            self.console.insert("end", f"\n> {msg}")
+            self.console.see("end")
+        except:
+            self.log(msg)  # Fallback
 
     def pull_ollama_model(self, model_tag):
         """Exécute 'ollama pull' et lit la sortie pour animer la console"""
@@ -1225,6 +1338,20 @@ class WizardApp(ctk.CTk):
         except FileNotFoundError:
              # Si ollama n'est pas trouvé malgré l'install
              raise Exception("Commande 'ollama' introuvable. Redémarrez le logiciel.")
+
+def check_existing_config():
+    """Vérifie si un fichier .OpenAuraConfig.json existe dans le dossier .OpenAura à la racine du PC"""
+    home_dir = os.path.expanduser("~")
+    config_dir = os.path.join(home_dir, ".OpenAura")
+
+    # Chercher tous les fichiers .OpenAuraConfig.json
+    if os.path.exists(config_dir):
+        for file in os.listdir(config_dir):
+            if file.endswith(".OpenAuraConfig.json"):
+                config_path = os.path.join(config_dir, file)
+                return config_path
+
+    return None
 
 if __name__ == "__main__":
     app = WizardApp()

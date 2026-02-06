@@ -39,7 +39,9 @@ ctk.set_default_color_theme("blue")
 # --- GESTION ROBUSTE DES CHEMINS ---
 # Pour core/dashboard.py, on remonte d'un cran pour trouver la racine
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CONFIG_FILE = os.path.join(BASE_DIR, "OpenAuraConfig.json")
+
+# Vérifier si le chemin du config est passé en variable d'environnement (par main.py)
+CONFIG_FILE = os.environ.get('OPENATURA_CONFIG_PATH', os.path.join(BASE_DIR, "OpenAuraConfig.json"))
 DB_PATH = os.path.join(BASE_DIR, "aura_memory.db")
 OLLAMA_API_URL = "http://localhost:11434/api/generate"
 
@@ -246,8 +248,8 @@ class AuraBrain:
         if not self.ensure_ollama_ready(): return
         try:
             res = requests.post(OLLAMA_API_URL, json={
-                "model": self.config.get("selected_model_tag", "moondream"),
-                "prompt": f"Synthèse fiche identité (Activité, Produits, Valeurs) : {txt}", 
+                "model": self.config.get("selected_model_tag", "moondream2"),
+                "prompt": f"Synthèse fiche identité (Activité, Produits, Valeurs) : {txt}",
                 "stream": False
             })
             if res.status_code == 200:
@@ -372,7 +374,7 @@ class AuraBrain:
         """
         
         try:
-            model = self.config.get("selected_model_tag", "moondream")
+            model = self.config.get("selected_model_tag", "moondream2")
             # Pour le rapport on préfère un modèle texte pur si possible, mais on garde le choix user
             res = requests.post(OLLAMA_API_URL, json={"model": model, "prompt": prompt, "stream": False}, timeout=90)
             if res.status_code == 200:

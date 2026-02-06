@@ -1,0 +1,26 @@
+# OpenAura AI - Requirements
+
+# Interface GUI
+customtkinter>=5.2.0
+Pillow>=10.0.0
+
+# Système
+psutil>=5.9.0
+watchdog>=3.0.0
+
+# Stockage
+keyring>=24.0.0
+
+# Web & API
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+
+# PDF
+pypdf>=3.17.0
+
+# PyInstaller pour la compilation
+pyinstaller>=5.13.0
+
+# WMI (Windows Management Instrumentation) - optionnel
+pypiwin32>=223
+
