@@ -1,3 +1,20 @@
+#  -------------------------------------------------------------------------
+#  OpenAura AI - Intelligence Artificielle Souveraine
+#  Copyright (C) 2026 RonoxDEV. All rights reserved.
+#
+#  LICENCE : PolyForm Noncommercial 1.0.0
+#  
+#  Usage personnel et éducatif : AUTORISÉ.
+#  Contributions communautaires (Pull Requests) : BIENVENUES.
+#  USAGE COMMERCIAL : STRICTEMENT INTERDIT.
+#  
+#  Toute utilisation au sein d'une entreprise ou pour un profit monétaire 
+#  nécessite une licence commerciale séparée de l'auteur.
+#  Contact : via GitHub <https://github.com/RonoxDEV/OpenAura-AI>
+#  -------------------------------------------------------------------------
+
+
+
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
 import threading
