@@ -73,6 +73,4 @@ OpenAura will be distributed as a standalone portable executable for Windows (`.
 
 ---
 
-## 📄 License
-
-Distribué sous la licence MIT. Voir `LICENSE` pour plus d'informations.
+🛡️ License: PolyForm Noncommercial (Free for individuals, Commercial License required for businesses).
